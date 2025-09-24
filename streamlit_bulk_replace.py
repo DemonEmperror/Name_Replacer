@@ -1,194 +1,220 @@
-# streamlit_bulk_replace.py
-# Streamlit UI for bulk_full_replace.py functionality
-# Run locally with: streamlit run streamlit_bulk_replace.py
+# streamlit_bulk_replace_upload.py
+# Streamlit app: upload a ZIP (folder), preview bulk replace, apply and download modified ZIP
+# Run: streamlit run streamlit_bulk_replace_upload.py
 
 import streamlit as st
-import pathlib
-import sys
-import shutil
 import zipfile
-import datetime
+import tempfile
+import pathlib
+import shutil
 import os
-from typing import List
+import io
+from typing import List, Tuple
+import difflib
+import datetime
 
-# ---- Config -----
-ALLOWED_SUFFIXES = [".json", ".log", ".lock"]
+ALLOWED_SUFFIXES = [".json", ".log", ".lock", ".txt", ".md"]
+MAX_FILE_LIST = 1000
 
-# ---- Utility functions -----
+st.set_page_config(page_title="Bulk Replace — Upload & Edit", layout="centered")
+st.title("Bulk Replace — upload, preview, apply, download")
 
-def find_content_candidates(root: pathlib.Path, old: str) -> List[pathlib.Path]:
-    candidates = []
-    for f in root.rglob("*"):
-        if f.is_file() and f.suffix in ALLOWED_SUFFIXES:
-            try:
-                text = f.read_text(encoding="utf-8")
-            except Exception:
-                continue
-            if old in text:
-                candidates.append(f)
-    return candidates
+st.markdown("""
+Upload a **zip** file containing a folder (or files). The app will:
 
+1. Extract the zip into a temporary workspace.
+2. Scan filenames, foldernames and file contents for the `old` substring (only certain suffixes).
+3. Show a preview (diffs and planned renames). You can pick which matches to apply.
+4. When you confirm, the app will perform the renames/edits and provide a download of the modified zip.
 
-def find_file_candidates(root: pathlib.Path, old: str) -> List[pathlib.Path]:
-    return [f for f in root.rglob("*") if f.is_file() and old in f.name]
+**Safety:** This runs inside the container where Streamlit is hosted and only affects the uploaded archive. Nothing is written to your machine unless you download the resulting zip.
+""")
 
-
-def find_folder_candidates(root: pathlib.Path, old: str) -> List[pathlib.Path]:
-    return [d for d in root.rglob("*") if d.is_dir() and old in d.name]
-
-
-def make_backup(root: pathlib.Path) -> str:
-    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    zipname = f"backup_{root.name}_{ts}.zip"
-    with zipfile.ZipFile(zipname, "w", zipfile.ZIP_DEFLATED) as zf:
-        for f in root.rglob("*"):
-            # write relative path
-            zf.write(f, arcname=str(f.relative_to(root.parent)))
-    return os.path.abspath(zipname)
-
-
-# ---- App UI -----
-st.set_page_config(page_title="Bulk Replace (safe)", layout="centered")
-st.title("Bulk Replace — Files, Folders and Contents")
-st.markdown(
-    """
-This app performs a **dry-run** by default and shows exactly what will change.
-
-**How to run:** host locally and point `Root folder` to a path accessible by the server. This app performs real file I/O when you click **Apply changes** — use the backup option.
-"""
-)
-
-with st.form(key="inputs"):
-    root_input = st.text_input("Root folder (absolute or relative)", value="tasks")
-    old = st.text_input("Old substring to replace", value="old-name-you-want-to-change")
-    new = st.text_input("New substring", value="new-name")
-    do_backup = st.checkbox("Create zip backup before applying", value=True)
-    apply_changes = st.checkbox("Apply changes (uncheck = dry run)", value=False)
-    extra_confirm = st.text_input("Type the word APPLY to enable destructive actions (case-sensitive)", value="")
-    submitted = st.form_submit_button("Scan")
-
-if not submitted:
-    st.info("Fill inputs and press **Scan** to preview changes.")
+uploaded = st.file_uploader("Upload a ZIP file (folder) to process", type=["zip"]) 
+if not uploaded:
+    st.info("Upload a zip to begin. The zip will be processed in memory/on-server and results offered as a download.")
     st.stop()
 
-# Validate root
-root = pathlib.Path(root_input)
-if not root.exists():
-    st.error(f"Root path not found: {root}")
-    st.stop()
-if not root.is_dir():
-    st.error("Root must be a directory")
+old = st.text_input("Old substring to replace", value="old-name-you-want-to-change")
+new = st.text_input("New substring", value="new-name")
+
+if not old:
+    st.error("Please enter the 'old' substring to search for.")
     st.stop()
 
-if apply_changes and extra_confirm != "APPLY":
-    st.warning("To actually apply changes you must type APPLY exactly in the confirmation box.")
-    apply_changes = False
+# options
+suffixes = st.multiselect("File suffixes to scan/replace in contents", ALLOWED_SUFFIXES, default=ALLOWED_SUFFIXES)
+show_diffs = st.checkbox("Show diffs for content changes", value=True)
 
-st.write(f"**Mode:** {'APPLY' if apply_changes else 'DRY RUN'}")
-st.write(f"Root: {root.resolve()}\nOld: '{old}' -> New: '{new}'")
+# Work in a temp dir
+with tempfile.TemporaryDirectory() as tmpdir:
+    tmpdir = pathlib.Path(tmpdir)
+    upload_path = tmpdir / "upload.zip"
+    with open(upload_path, "wb") as f:
+        f.write(uploaded.getbuffer())
 
-# Scan
-with st.spinner("Scanning files..."):
-    content_candidates = find_content_candidates(root, old)
-    file_candidates = find_file_candidates(root, old)
-    folder_candidates = find_folder_candidates(root, old)
-
-st.markdown("### Preview")
-col1, col2, col3 = st.columns(3)
-col1.metric("Files with content matches", len(content_candidates))
-col2.metric("Files with names to rename", len(file_candidates))
-col3.metric("Folders to rename", len(folder_candidates))
-
-if len(content_candidates) > 0:
-    with st.expander("Files that contain the old substring (content)"):
-        for f in content_candidates:
-            st.write(f)
-
-if len(file_candidates) > 0:
-    with st.expander("Files with the old substring in the filename"):
-        for f in sorted(file_candidates, key=lambda x: -len(str(x))):
-            st.write(f)
-
-if len(folder_candidates) > 0:
-    with st.expander("Folders with the old substring in the foldername"):
-        for d in sorted(folder_candidates, key=lambda x: -len(str(x))):
-            st.write(d)
-
-# If dry run only, offer example rename preview
-if not apply_changes:
-    st.success("Dry run complete. Review the previews above. Check Apply changes and confirm to perform the operations.")
-    st.stop()
-
-# At this point user chose to apply changes and typed APPLY
-# Backup
-backup_path = None
-if do_backup:
+    extract_dir = tmpdir / "extracted"
+    extract_dir.mkdir()
     try:
-        with st.spinner("Creating backup (this may take time)..."):
-            backup_path = make_backup(root)
-        st.success(f"Backup created: {backup_path}")
-    except Exception as e:
-        st.error(f"Backup failed: {e}")
+        with zipfile.ZipFile(upload_path, "r") as zf:
+            zf.extractall(extract_dir)
+    except zipfile.BadZipFile:
+        st.error("Uploaded file is not a valid ZIP archive.")
         st.stop()
 
-# Apply changes
-log_lines = []
-# Step 1: rename files (deepest first)
-file_candidates_sorted = sorted(file_candidates, key=lambda x: -len(str(x)))
-for f in file_candidates_sorted:
-    new_name = f.name.replace(old, new)
-    new_path = f.parent / new_name
-    entry = f"RENAME FILE: {f} -> {new_path}"
-    if new_path.exists():
-        entry += f"  SKIP (target exists)"
-        log_lines.append(entry)
-        continue
-    try:
-        f.rename(new_path)
-        log_lines.append(entry + "  OK")
-    except Exception as e:
-        log_lines.append(entry + f"  ERROR: {e}")
+    # Gather candidates
+    content_candidates: List[pathlib.Path] = []
+    file_rename_candidates: List[Tuple[pathlib.Path, pathlib.Path]] = []
+    folder_rename_candidates: List[Tuple[pathlib.Path, pathlib.Path]] = []
 
-# Step 2: rename folders (deepest first)
-folder_candidates_sorted = sorted(folder_candidates, key=lambda x: -len(str(x)))
-for d in folder_candidates_sorted:
-    new_name = d.name.replace(old, new)
-    new_path = d.parent / new_name
-    entry = f"RENAME FOLDER: {d} -> {new_path}"
-    if new_path.exists():
-        entry += f"  SKIP (target exists)"
-        log_lines.append(entry)
-        continue
-    try:
-        d.rename(new_path)
-        log_lines.append(entry + "  OK")
-    except Exception as e:
-        log_lines.append(entry + f"  ERROR: {e}")
-
-# Step 3: replace contents
-changed = 0
-for f in root.rglob("*"):
-    if f.is_file() and f.suffix in ALLOWED_SUFFIXES:
-        try:
-            text = f.read_text(encoding="utf-8")
-        except Exception:
-            continue
-        if old in text:
+    for p in extract_dir.rglob("*"):
+        # skip overly large enumerations
+        # file names / folder names
+        if old in p.name:
+            if p.is_file():
+                file_rename_candidates.append((p, p.with_name(p.name.replace(old, new))))
+            elif p.is_dir():
+                folder_rename_candidates.append((p, p.with_name(p.name.replace(old, new))))
+        # content matches
+        if p.is_file() and p.suffix in suffixes:
             try:
-                f.write_text(text.replace(old, new), encoding="utf-8")
-                log_lines.append(f"UPDATED CONTENT: {f}")
-                changed += 1
+                txt = p.read_text(encoding="utf-8")
+            except Exception:
+                continue
+            if old in txt:
+                content_candidates.append(p)
+
+    st.markdown("### Preview")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Files with content matches", len(content_candidates))
+    c2.metric("Files to rename", len(file_rename_candidates))
+    c3.metric("Folders to rename", len(folder_rename_candidates))
+
+    if len(folder_rename_candidates) > 0:
+        with st.expander("Folders that will be renamed"):
+            for src, dst in sorted(folder_rename_candidates, key=lambda x: -len(str(x[0]))):
+                st.write(f"{src.relative_to(extract_dir)}  ->  {dst.name}")
+
+    if len(file_rename_candidates) > 0:
+        with st.expander("Files that will be renamed"):
+            for src, dst in sorted(file_rename_candidates, key=lambda x: -len(str(x[0]))):
+                st.write(f"{src.relative_to(extract_dir)}  ->  {dst.name}")
+
+    if len(content_candidates) > 0 and show_diffs:
+        with st.expander("Content diffs (first 200 lines per file)"):
+            for fpath in content_candidates[:MAX_FILE_LIST]:
+                try:
+                    old_text = fpath.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                new_text = old_text.replace(old, new)
+                # show a short unified diff
+                diff = difflib.unified_diff(
+                    old_text.splitlines(keepends=True)[:200],
+                    new_text.splitlines(keepends=True)[:200],
+                    fromfile=str(fpath.relative_to(extract_dir)),
+                    tofile=str(fpath.relative_to(extract_dir)) + " (updated)",
+                    lineterm=""
+                )
+                st.text_area(str(fpath.relative_to(extract_dir)), value=''.join(diff), height=200)
+
+    # Allow user to select which operations to perform
+    st.markdown("### Select changes to apply")
+    do_rename_files = False
+    do_rename_folders = False
+    do_change_contents = False
+
+    if len(file_rename_candidates) > 0:
+        do_rename_files = st.checkbox(f"Apply filename renames ({len(file_rename_candidates)})", value=True)
+    if len(folder_rename_candidates) > 0:
+        do_rename_folders = st.checkbox(f"Apply folder renames ({len(folder_rename_candidates)})", value=True)
+    if len(content_candidates) > 0:
+        do_change_contents = st.checkbox(f"Apply content replacements ({len(content_candidates)})", value=True)
+
+    confirm_word = st.text_input("Type APPLY to enable the Apply button (case-sensitive)")
+    apply_button = st.button("Apply changes and produce download", disabled=(confirm_word != "APPLY"))
+
+    if not apply_button:
+        st.info("Type APPLY and press the button to perform the selected operations.")
+        st.stop()
+
+    # Perform operations in a new workspace so we don't mutate while iterating
+    work_dir = tmpdir / "work"
+    shutil.copytree(extract_dir, work_dir)
+
+    log_lines: List[str] = []
+
+    # Rename files (deepest first)
+    if do_rename_files:
+        files_sorted = sorted([p for p, _ in file_rename_candidates], key=lambda x: -len(str(x)))
+        for src in files_sorted:
+            rel = src.relative_to(extract_dir)
+            dst_name = src.name.replace(old, new)
+            dst = work_dir.joinpath(rel.parent) / dst_name
+            try:
+                dst_parent = dst.parent
+                dst_parent.mkdir(parents=True, exist_ok=True)
+                src_work = work_dir.joinpath(rel)
+                if dst.exists():
+                    log_lines.append(f"SKIP rename (target exists): {rel} -> {dst_name}")
+                    continue
+                src_work.rename(dst)
+                log_lines.append(f"RENAMED FILE: {rel} -> {dst_name}")
             except Exception as e:
-                log_lines.append(f"ERROR updating {f}: {e}")
+                log_lines.append(f"ERROR renaming {rel}: {e}")
 
-log_lines.append(f"TOTAL content files updated: {changed}")
+    # Rename folders (deepest first)
+    if do_rename_folders:
+        folders_sorted = sorted([p for p, _ in folder_rename_candidates], key=lambda x: -len(str(x)))
+        for src in folders_sorted:
+            rel = src.relative_to(extract_dir)
+            dst_name = src.name.replace(old, new)
+            src_work = work_dir.joinpath(rel)
+            dst = src_work.parent / dst_name
+            try:
+                if dst.exists():
+                    log_lines.append(f"SKIP folder rename (target exists): {rel} -> {dst_name}")
+                    continue
+                src_work.rename(dst)
+                log_lines.append(f"RENAMED FOLDER: {rel} -> {dst_name}")
+            except Exception as e:
+                log_lines.append(f"ERROR renaming folder {rel}: {e}")
 
-st.success("Apply completed — see log below")
-with st.expander("Operation log", expanded=True):
-    for line in log_lines:
-        st.text(line)
+    # Apply content replacements
+    changed = 0
+    if do_change_contents:
+        for f in work_dir.rglob("*"):
+            if f.is_file() and f.suffix in suffixes:
+                try:
+                    text = f.read_text(encoding="utf-8")
+                except Exception:
+                    continue
+                if old in text:
+                    try:
+                        f.write_text(text.replace(old, new), encoding="utf-8")
+                        changed += 1
+                        log_lines.append(f"UPDATED CONTENT: {f.relative_to(work_dir)}")
+                    except Exception as e:
+                        log_lines.append(f"ERROR updating {f.relative_to(work_dir)}: {e}")
 
-if backup_path:
-    st.download_button("Download backup zip", data=open(backup_path, "rb"), file_name=os.path.basename(backup_path))
+    log_lines.append(f"TOTAL content files updated: {changed}")
 
-st.info("Finished. Make sure your repository is clean and verify results. This tool performs irreversible filesystem operations.")
+    # Create output zip
+    out_ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    out_name = f"modified_{out_ts}.zip"
+    out_path = tmpdir / out_name
+    with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for p in work_dir.rglob("*"):
+            zf.write(p, arcname=str(p.relative_to(work_dir)))
+
+    st.success("Operations completed — download the modified zip below")
+    with st.expander("Operation log", expanded=True):
+        for ln in log_lines:
+            st.text(ln)
+
+    # Offer download
+    with open(out_path, "rb") as fh:
+        data = fh.read()
+    st.download_button("Download modified ZIP", data=data, file_name=out_name, mime="application/zip")
+
+    st.info("Done. You can repeat the flow with another upload. Remember this app modifies only the uploaded archive on the server-side workspace.")
